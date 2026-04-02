@@ -1,5 +1,3 @@
-## Parts List
-
 | Part | Qty | Cost | Link | Notes |
 |-----|-----|-------|-------|-------|
 | Raspberry Pi Zero W | 1 | $15 | [raspberrypi](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/) | Any Pi Zero variant works |
