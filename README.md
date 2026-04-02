@@ -5,12 +5,10 @@
 ## Table of Contents
 
 - [Introduction](#introduction)
-- [Build Guide](#sounds-cool-i-want-to-make-one)
-- [3D Printing](#3d-printing)
+- [Build Guide](#build-guide)
+- [Hardware](#hardware)
 - [Software](#software)
-- [Parts List](#parts-list)
-- [Issues](#issues)
-- [TODO](#todo)
+- [Cost](#cost)
 
 ## Introduction
 
@@ -28,7 +26,7 @@ After creating the first one, I wanted to make it as cheap and available as poss
 
 Since this is still a WIP, and I am ironing out some small changes, I have not created a formal build guide yet. However, I have put together 3 BOMs down below. Expect a build guide soon!
 
-## CAD
+## Hardware
 
 You can find STEP and STL files available in the [CAD](CAD) directory, or if you want to go spin the model around, you can check it out in Onshape [here](https://cad.onshape.com/documents/e6482d1ab00cb5a2719e37b7/w/38d6de8130338c05d74e4ecf/e/8865c15cb975933cc3691846?renderMode=0&uiState=69bdc61baa0cf63feb704019). Onshape is free to use (but all designs are public), so I encourage you to create an account and start learning about CAD!
 
@@ -36,9 +34,7 @@ The Onshape file has 3 versions, which are as follows:
 
 Main - Original design, utilizes Waveshare battery hat
 PiJuice - Improved design, utilizes PiJuice Zero hat
-Android - Adapted design, utilizes Android phone instead of Raspberry Pi
-
-## 3D Printing
+Android - Adapted design, utilizes Android phone instead of Raspberry Pi. 
 
 If you want to 3D print this, you can find the STLs and 3MF files in the [CAD](CAD) directory.
 
@@ -55,44 +51,12 @@ My current setup revolves around using 3 virtual terminals:
 
 In the Software folder, you will also find my .bashrc and .bashprofile file, which contain small tweaks to make switching virtual terminals as easy as possible.
 
-## Parts List
+## Cost
 
-| Part | Qty | Cost | Link | Notes |
-|-----|-----|-------|-------|-------|
-| Raspberry Pi Zero W | 1 | $15 | [raspberrypi](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/) | Any Pi Zero variant works |
-| 5.5" AMOLED Screen | 1 | $45 | [aliexpress](https://www.aliexpress.us/item/3256805978359959.html?channel=twinner) | Any HDMI screen will work, but enclosure will need redesign|
-| Air40 Keyboard PCB | 1 | $35-$45 | [aliexpress](https://www.aliexpress.us/item/3256805656168067.html?channel=twinner) | Non-Hot Swap variant works as well | 
-| UPS Hat | 1 | $25 | [waveshare](https://www.waveshare.com/ups-hat-c.htm) | Any 3.7V Lipo battery w/ JST connector works|
-| Keyboard Switches | 47 | ~$20 | [hippokeys](https://hippokeys.com/) | Any MX style switch works |
-| Keycaps | 47 | $14 | [chosfox](https://chosfox.com/products/chosfox-geonix-rev-2-original-keycap-set) | Any MX keycap set will work |
-| Right angle USB C Adapter | 1 | $9 | [amazon](https://a.co/d/0iD8tdOh) | Make sure to get the **right** variant |
-| USB C to Micro B Cable | 1 | $8 | [amazon](https://a.co/d/02apOZqa) | I used the 1 foot variant, any brand will do |
-| FPC Mini HDMI to HDMI Cable | 1 | $9 | [amazon](https://a.co/d/05EBCFm5) | Make sure to get 0.2M variant |
-| FPC Mini HDMI connector | 1 | $7 | [amazon](https://a.co/d/0dyc08eN) | Unfortunately there are no mini-to-mini FPC cables, this replaces the standard HDMI connector |
-| USB C Cable | 1 | $2 | [amazon](https://a.co/d/090tin6A) | Any USB C to 5V and GND bare wire will do |
-| Machine Screws| 6 | ~$1 | [amazon](https://a.co/d/0e3UtxS2) | Any M3 x 25mm screw will do |
-| Self Tapping Screws | 12 | ~$1 | [amazon](https://a.co/d/05gDwUqy) | 8x M2.6 x 8mm, 4x M2.3 x 5mm |
-| Wires | ~ | ~ | ~ | Need to figure out better wiring solution |
-| PLA Filament | ~ | ~ | ~ | Will update with exact filament usage |
-
-**Total: ~$200**
-
-## Issues
-
-The OLED screen that I sourced arrived crooked, meaning that I had to adjust the mounting holes on the screen holder. I plan to make the holes larger and incorporate washers to accomodate for this discrepancy.
-
-The battery life sucks right now, and the power switch does a full power cycle when flipped. Hopefully with the PiJuice Zero I can integrate a sleep mode.
-
-## Block Diagram
-
-Below is the proposed block diagram for the next version of the Bee-Write-Back.
-
-![Bee Write Back](images/block.jpeg)
-
-## TODO
-
-- [x] Create Github repo
-- [x] Record demo for Youtube
-- [ ] Integrate PiJuice power hat
-- [ ] Integrate I2S audio hat
-- [ ] Clean up wiring (custom PCB?)
+For more a more detailed breakdown of the cost for each variant, please reference the individual BOMs in their respective directory. Below are the rough totals for each variant. Screws, wires and filament are not included in the total cost. Note: the Android variant cost does not include the phone, but I have seen phones for as little as $20 on FB Marketplace.
+  
+- Original: $220
+- PiJuice: $250
+- Android: $120  
+  
+**This number does NOT include shipping, taxes and/or tariffs**
