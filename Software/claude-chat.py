@@ -37,13 +37,51 @@ MAX_TOKENS = 4096
 SESSIONS_DIR = os.path.expanduser("~/conversations/sessions")
 SCRIPTS_DIR = os.path.expanduser("~/scripts")
 LASTCMD_FILE = os.path.expanduser("~/.lastcmd")
-SYSTEM_PROMPT = (
+TTY1_LOG = os.path.expanduser("~/.tty1.log")
+CONTEXT_FILE = os.path.expanduser("~/context.txt")
+BASE_SYSTEM_PROMPT = (
     "You are a helpful, curious assistant. Keep responses clear and "
     "conversational. The user is chatting from a small dedicated terminal "
     "device, so avoid excessive formatting — prefer flowing prose over heavy "
     "use of markdown, bullet points, or headers. When providing code, always "
     "use fenced code blocks with the language specified."
 )
+
+
+def build_system_prompt():
+    """Build full system prompt from base + context file + session index."""
+    parts = [BASE_SYSTEM_PROMPT]
+
+    # Load user context file
+    if os.path.exists(CONTEXT_FILE):
+        try:
+            with open(CONTEXT_FILE, 'r') as f:
+                ctx = f.read().strip()
+            if ctx:
+                parts.append(f"\nHere is some context about the user and their setup:\n{ctx}")
+        except Exception:
+            pass
+
+    # Build session index for cross-chat awareness
+    try:
+        sessions = list_sessions()
+        if sessions:
+            session_list = []
+            for s in sessions[:30]:  # cap at 30 most recent
+                title = s["title"]
+                date = s["updated"][:10] if s["updated"] else ""
+                msgs = s["exchanges"]
+                session_list.append(f"- {title} ({date}, {msgs} messages)")
+            index = "\n".join(session_list)
+            parts.append(
+                f"\nThe user has had the following recent conversations with you "
+                f"on this device. You don't have the full content of these chats, "
+                f"but you're aware they happened:\n{index}"
+            )
+    except Exception:
+        pass
+
+    return "\n".join(parts)
 
 # ── Markdown Processing ────────────────────────────────────────────────────
 
@@ -69,15 +107,65 @@ def strip_inline_markdown(text):
     return text
 
 
+def strip_ansi(text):
+    """Aggressively clean terminal output for API consumption."""
+    # Remove all ANSI escape sequences
+    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)     # OSC sequences
+    text = re.sub(r'\x1b\([A-Z]', '', text)              # character set switches
+    text = re.sub(r'\x1b[>=<]', '', text)                 # keypad/cursor modes
+    text = re.sub(r'\x1b\[\?[0-9;]*[a-zA-Z]', '', text)  # private mode sequences
+    text = re.sub(r'\x1b.', '', text)                     # any remaining escapes
+    # Strip all non-printable characters except \t \n
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Collapse carriage returns (script uses \r\n)
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    # Collapse excessive blank lines
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    # Remove lines that are just whitespace
+    lines = [l for l in text.split('\n') if l.strip() or l == '']
+    return '\n'.join(lines)
+
+
+def read_tty1_tail(num_lines=50):
+    """Read the last N lines from tty1 log, clean for API use."""
+    if not os.path.exists(TTY1_LOG):
+        return None
+    try:
+        with open(TTY1_LOG, 'rb') as f:
+            raw = f.read()
+        # Decode permissively
+        text = raw.decode('utf-8', errors='replace')
+        # Strip terminal junk
+        text = strip_ansi(text)
+        # Take last N lines
+        lines = text.split('\n')
+        tail = lines[-num_lines:]
+        result = '\n'.join(tail).strip()
+        # Final safety: ensure only valid UTF-8 printable content
+        result = result.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+        return result if result else None
+    except Exception:
+        return None
+
+
 def process_markdown(text):
     output = []
     in_code_block = False
+    block_num = 0
     for line in text.split('\n'):
         stripped = line.strip()
         if stripped.startswith('```'):
             in_code_block = not in_code_block
             if in_code_block:
+                block_num += 1
+                lang = stripped[3:].strip()
+                label = f"── block {block_num}"
+                if lang:
+                    label += f" ({lang})"
+                label += " ──"
                 output.append(("", "normal"))
+                output.append((label, "block_label"))
             continue
         if in_code_block:
             output.append((line, "code"))
@@ -120,6 +208,120 @@ def extract_code_blocks(text):
         code = match.group(2).rstrip('\n')
         blocks.append((lang, code))
     return blocks
+
+# ── File/Directory Upload ──────────────────────────────────────────────────
+
+# Skip these directories
+SKIP_DIRS = {
+    '.git', '__pycache__', 'node_modules', '.venv', 'venv', 'env',
+    'build', 'dist', '.eggs', '*.egg-info', '.tox', '.mypy_cache',
+    '.pytest_cache', '.idea', '.vscode', '.DS_Store', 'target',
+}
+
+# Skip files with these extensions
+SKIP_EXTS = {
+    '.pyc', '.pyo', '.o', '.so', '.dylib', '.a', '.lib', '.dll',
+    '.exe', '.bin', '.img', '.iso', '.tar', '.gz', '.zip', '.bz2',
+    '.xz', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.gif', '.bmp',
+    '.ico', '.svg', '.mp3', '.mp4', '.wav', '.avi', '.mov', '.pdf',
+    '.enc', '.key', '.db', '.sqlite', '.sqlite3',
+}
+
+MAX_FILE_SIZE = 50000       # skip files larger than 50KB
+MAX_TOTAL_CHARS = 80000     # cap total content
+
+
+def is_binary(filepath):
+    """Quick check if a file appears to be binary."""
+    try:
+        with open(filepath, 'rb') as f:
+            chunk = f.read(1024)
+        return b'\x00' in chunk
+    except Exception:
+        return True
+
+
+def collect_files(path):
+    """
+    Collect readable files from a path (file or directory).
+    Returns list of (relative_path, content) and a stats dict.
+    """
+    path = os.path.expanduser(path)
+    files = []
+    stats = {"total_files": 0, "skipped": 0, "total_chars": 0}
+
+    if os.path.isfile(path):
+        try:
+            with open(path, 'r', errors='replace') as f:
+                content = f.read()
+            files.append((os.path.basename(path), content))
+            stats["total_files"] = 1
+            stats["total_chars"] = len(content)
+        except Exception:
+            pass
+        return files, stats
+
+    if not os.path.isdir(path):
+        return files, stats
+
+    for root, dirs, filenames in os.walk(path):
+        # Filter directories in-place
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS
+                   and not d.startswith('.')]
+
+        for fname in sorted(filenames):
+            if fname.startswith('.'):
+                stats["skipped"] += 1
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SKIP_EXTS:
+                stats["skipped"] += 1
+                continue
+
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, path)
+
+            if os.path.getsize(fpath) > MAX_FILE_SIZE:
+                stats["skipped"] += 1
+                continue
+            if is_binary(fpath):
+                stats["skipped"] += 1
+                continue
+
+            try:
+                with open(fpath, 'r', errors='replace') as f:
+                    content = f.read()
+                files.append((rel, content))
+                stats["total_files"] += 1
+                stats["total_chars"] += len(content)
+            except Exception:
+                stats["skipped"] += 1
+
+    return files, stats
+
+
+def format_upload(files, max_chars=MAX_TOTAL_CHARS):
+    """Format collected files into a single string with path headers."""
+    parts = []
+    chars = 0
+    included = 0
+    truncated = False
+
+    for rel_path, content in files:
+        entry = f"── {rel_path} ──\n{content}\n\n"
+        if chars + len(entry) > max_chars:
+            truncated = True
+            remaining = max_chars - chars
+            if remaining > 200:
+                entry = f"── {rel_path} ──\n{content[:remaining]}...\n[truncated]\n\n"
+                parts.append(entry)
+                included += 1
+            break
+        parts.append(entry)
+        chars += len(entry)
+        included += 1
+
+    return ''.join(parts), included, truncated
 
 # ── Session Management ─────────────────────────────────────────────────────
 
@@ -187,12 +389,14 @@ def delete_session(filename):
 
 # ── API ─────────────────────────────────────────────────────────────────────
 
-def fetch_response(client, messages):
+def fetch_response(client, messages, system_prompt=None):
+    if system_prompt is None:
+        system_prompt = BASE_SYSTEM_PROMPT
     try:
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=messages,
         )
         text = ""
@@ -240,7 +444,8 @@ def draw_help_bar(stdscr, text):
         pass
 
 
-def build_exchange_lines(exchanges, view_idx, width, prompt_color):
+def build_exchange_lines(exchanges, view_idx, width, prompt_color, expanded=False):
+    MAX_PROMPT_LINES = 3  # collapsed prompt height
     lines = []
     if view_idx < 0 or view_idx >= len(exchanges):
         return lines
@@ -248,18 +453,33 @@ def build_exchange_lines(exchanges, view_idx, width, prompt_color):
     lines.append({"text": "", "style": curses.A_NORMAL})
     lines.append({"text": "  you ›", "style": prompt_color | curses.A_BOLD})
     lines.append({"text": "", "style": curses.A_NORMAL})
-    for wl in wrap_text(user_msg, width - 4):
-        lines.append({"text": f"  {wl}", "style": prompt_color})
+
+    prompt_wrapped = wrap_text(user_msg, width - 4)
+    if not expanded and len(prompt_wrapped) > MAX_PROMPT_LINES:
+        for wl in prompt_wrapped[:MAX_PROMPT_LINES]:
+            lines.append({"text": f"  {wl}", "style": prompt_color})
+        hidden = len(prompt_wrapped) - MAX_PROMPT_LINES
+        lines.append({"text": f"  ... {hidden} more lines [e to expand]",
+                       "style": curses.A_DIM})
+    else:
+        for wl in prompt_wrapped:
+            lines.append({"text": f"  {wl}", "style": prompt_color})
+        if len(prompt_wrapped) > MAX_PROMPT_LINES:
+            lines.append({"text": "  [e to collapse]", "style": curses.A_DIM})
+
     lines.append({"text": "", "style": curses.A_NORMAL})
     lines.append({"text": "  claude ›", "style": curses.A_BOLD})
     lines.append({"text": "", "style": curses.A_NORMAL})
     code_style = curses.color_pair(2)
+    label_style = curses.color_pair(3)
     md_lines = process_markdown(assistant_msg)
     for text, hint in md_lines:
         if hint == "header":
             style = curses.A_BOLD | curses.A_UNDERLINE
         elif hint == "code":
             style = code_style
+        elif hint == "block_label":
+            style = label_style | curses.A_DIM
         else:
             style = curses.A_NORMAL
         if text.strip() == '':
@@ -278,8 +498,15 @@ def wrap_input(buf, width, prefix=" you › "):
     full = prefix + buf
     input_lines = []
     while len(full) > width:
-        input_lines.append(full[:width])
-        full = full[width:]
+        # Find last space within width for word wrap
+        break_at = full.rfind(' ', 0, width)
+        if break_at > 0:
+            input_lines.append(full[:break_at])
+            full = full[break_at + 1:]
+        else:
+            # No space found — hard wrap
+            input_lines.append(full[:width])
+            full = full[width:]
     input_lines.append(full)
     return input_lines
 
@@ -330,7 +557,7 @@ def draw_screen(stdscr, lines, scroll, prompt_color, view_idx, total,
                 except curses.error:
                     pass
     else:
-        help_text = " ↑↓ scroll  [/] prev/next  g/G top/end  i:ask  q:quit"
+        help_text = " ↑↓ scroll  ←→ prev/next  e:expand  g/G top/end  i:ask  h:help  q:quit"
         try:
             stdscr.addstr(h - 1, 0, help_text[:w] + " " * max(0, w - len(help_text)),
                           curses.A_DIM)
@@ -412,6 +639,13 @@ def get_input(stdscr, lines, scroll, prompt_color, view_idx, total):
     h, w = stdscr.getmaxyx()
     prefix = " you › "
     while True:
+        # Recalculate max_scroll accounting for input area height
+        input_wrapped = wrap_input(buf, w, prefix)
+        input_h = len(input_wrapped)
+        text_h = h - 1 - input_h  # content area above status bar
+        max_scroll = max(0, len(lines) - text_h)
+        scroll = max(0, min(scroll, max_scroll))
+
         draw_screen(stdscr, lines, scroll, prompt_color, view_idx, total,
                      input_mode=True, input_buf=buf)
         input_lines = wrap_input(buf, w, prefix)
@@ -434,6 +668,15 @@ def get_input(stdscr, lines, scroll, prompt_color, view_idx, total):
             buf = buf[:-1]
         elif ch == 21:
             buf = ""
+        # Scrolling while composing
+        elif ch == curses.KEY_UP:
+            scroll = max(0, scroll - 1)
+        elif ch == curses.KEY_DOWN:
+            scroll = min(max_scroll, scroll + 1)
+        elif ch == curses.KEY_PPAGE:
+            scroll = max(0, scroll - text_h)
+        elif ch == curses.KEY_NPAGE:
+            scroll = min(max_scroll, scroll + text_h)
         elif 32 <= ch <= 126:
             max_chars = (h // 2) * w
             if len(buf) < max_chars:
@@ -522,8 +765,11 @@ def session_picker(stdscr, accent):
                 if idx >= len(sessions):
                     break
                 s = sessions[idx]
-                title = s["title"][:w - 30]
                 meta = f"{s['exchanges']} msg  {s['updated'][:10]}"
+                # Sanitize title: strip newlines, limit width
+                raw_title = s["title"].replace('\n', ' ').replace('\r', ' ').strip()
+                max_title = w - len(meta) - 5  # 3 prefix + 2 padding
+                title = raw_title[:max(10, max_title)]
                 row = i + 1
 
                 if idx == sel:
@@ -589,13 +835,17 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
     save_filename = session_data.get("save_filename", "")  # remembered /save filename
     view_idx = len(exchanges) - 1 if exchanges else -1
     scroll = 0
+    expanded = False  # whether long prompts are shown in full
     status_msg = ""
     status_time = 0
+
+    # Build system prompt with context + session awareness
+    system_prompt = build_system_prompt()
 
     # Welcome / initial lines
     if exchanges:
         h, w = stdscr.getmaxyx()
-        lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+        lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
     else:
         lines = [
             {"text": "", "style": curses.A_NORMAL},
@@ -611,7 +861,7 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
         session_data["api_messages"] = api_messages
         session_data["save_filename"] = save_filename
         if exchanges and not session_data.get("title"):
-            session_data["title"] = make_slug(exchanges[0][0], 8).replace("_", " ")
+            session_data["title"] = exchanges[0][0].strip().split('\n')[0][:60]
         session_filename = save_session(session_data, session_filename)
 
     while True:
@@ -644,35 +894,95 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
             scroll = max_scroll
 
         # ── Exchange Navigation ──
-        elif ch == ord('[') or ch == ord('p'):
+        elif ch == curses.KEY_LEFT or ch == ord('['):
             if view_idx > 0:
                 view_idx -= 1
-                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+                expanded = False
+                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
                 scroll = 0
-        elif ch == ord(']') or ch == ord('n'):
+        elif ch == curses.KEY_RIGHT or ch == ord(']'):
             if view_idx < len(exchanges) - 1:
                 view_idx += 1
-                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+                expanded = False
+                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
                 scroll = 0
         elif ch == ord('{'):
             if exchanges:
                 view_idx = 0
-                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+                expanded = False
+                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
                 scroll = 0
         elif ch == ord('}'):
             if exchanges:
                 view_idx = len(exchanges) - 1
-                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+                expanded = False
+                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
                 scroll = 0
+
+        # ── Expand/Collapse Prompt ──
+        elif ch == ord('e'):
+            if exchanges and view_idx >= 0:
+                expanded = not expanded
+                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
+                scroll = 0
+
+        # ── Help Screen ──
+        elif ch == ord('h'):
+            help_lines = [
+                {"text": "", "style": curses.A_NORMAL},
+                {"text": "  claude-chat help", "style": curses.A_BOLD},
+                {"text": "", "style": curses.A_NORMAL},
+                {"text": "  Navigation", "style": curses.A_BOLD | curses.A_UNDERLINE},
+                {"text": "  ↑/↓  j/k       scroll up/down", "style": curses.A_NORMAL},
+                {"text": "  PgUp/PgDn       scroll by page", "style": curses.A_NORMAL},
+                {"text": "  ←/→  [/]        previous/next exchange", "style": curses.A_NORMAL},
+                {"text": "  {/}             first/last exchange", "style": curses.A_NORMAL},
+                {"text": "  g/G             jump to top/bottom", "style": curses.A_NORMAL},
+                {"text": "  e               expand/collapse long prompts", "style": curses.A_NORMAL},
+                {"text": "", "style": curses.A_NORMAL},
+                {"text": "  Input", "style": curses.A_BOLD | curses.A_UNDERLINE},
+                {"text": "  i  or  :        start typing a message", "style": curses.A_NORMAL},
+                {"text": "  Ctrl+U          clear input line", "style": curses.A_NORMAL},
+                {"text": "  Esc             cancel input", "style": curses.A_NORMAL},
+                {"text": "", "style": curses.A_NORMAL},
+                {"text": "  Commands (type in input mode)", "style": curses.A_BOLD | curses.A_UNDERLINE},
+                {"text": "  /save [file] [#] save code block to ~/scripts/", "style": curses.color_pair(2)},
+                {"text": "  /cmd [#]         send code block to tty1", "style": curses.color_pair(2)},
+                {"text": "  /blocks          list all code blocks in response", "style": curses.color_pair(2)},
+                {"text": "  /upload <path>   upload file or folder to conversation", "style": curses.color_pair(2)},
+                {"text": "  /term            share tty1 output with Claude", "style": curses.color_pair(2)},
+                {"text": "  /model [name]    show or switch model", "style": curses.color_pair(2)},
+                {"text": "  /quit            save session and exit", "style": curses.color_pair(2)},
+                {"text": "", "style": curses.A_NORMAL},
+                {"text": "  press h, q, Esc, or Enter to close", "style": curses.A_DIM},
+                {"text": "", "style": curses.A_NORMAL},
+            ]
+            lines = help_lines
+            scroll = 0
+            # Wait for a deliberate dismiss key
+            while True:
+                draw_screen(stdscr, lines, scroll, prompt_color, view_idx, total)
+                dismiss = stdscr.getch()
+                if dismiss in (ord('h'), ord('q'), 27, 10, 13, ord(' ')):
+                    break
+                elif dismiss == curses.KEY_UP or dismiss == ord('k'):
+                    scroll = max(0, scroll - 1)
+                elif dismiss == curses.KEY_DOWN or dismiss == ord('j'):
+                    scroll = min(max(0, len(lines) - (h - 2)), scroll + 1)
+            if exchanges and view_idx >= 0:
+                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
+            else:
+                lines = [
+                    {"text": "", "style": curses.A_NORMAL},
+                    {"text": "  new conversation", "style": curses.A_BOLD},
+                    {"text": "", "style": curses.A_NORMAL},
+                    {"text": "  Press [i] to start typing.", "style": curses.A_DIM},
+                    {"text": "", "style": curses.A_NORMAL},
+                ]
+            scroll = 0
 
         # ── Input ──
         elif ch == ord('i') or ch == ord(':'):
-            if exchanges:
-                view_idx = len(exchanges) - 1
-                lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
-                max_scroll = max(0, len(lines) - text_h)
-                scroll = max_scroll
-
             user_input = get_input(stdscr, lines, scroll, prompt_color,
                                     view_idx, total)
             if user_input is None or user_input == "":
@@ -688,7 +998,7 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
                     return session_data, session_filename
 
                 elif cmd in ("/help", "/h"):
-                    status_msg = "/save /cmd /blocks /model /quit  ↑↓ [/] g/G"
+                    status_msg = "press Esc then h for full help"
                     status_time = time.time()
                     continue
 
@@ -825,6 +1135,116 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
                     status_time = time.time()
                     continue
 
+                elif cmd == "/term":
+                    term_text = read_tty1_tail(50)
+                    if not term_text:
+                        status_msg = "no tty1 log — check ~/.bash_profile script setup"
+                        status_time = time.time()
+                        continue
+                    # Trim hard to avoid oversized requests
+                    if len(term_text) > 2000:
+                        term_text = term_text[-2000:]
+                    context = prompt_simple(stdscr, "message: ")
+                    if context is None:
+                        continue
+                    if context:
+                        full_msg = f"{context}\n\nHere is my recent terminal output:\n\n{term_text}"
+                    else:
+                        full_msg = f"Here is my recent terminal output:\n\n{term_text}"
+                    # Send as a message
+                    api_messages.append({"role": "user", "content": full_msg})
+                    done_event = threading.Event()
+                    result = {"text": None, "error": None}
+                    def api_thread_err():
+                        result["text"], result["error"] = fetch_response(client, api_messages, system_prompt)
+                        done_event.set()
+                    thread = threading.Thread(target=api_thread_err, daemon=True)
+                    thread.start()
+                    animate_thinking(stdscr, done_event)
+                    thread.join()
+                    if result["error"]:
+                        api_messages.pop()
+                        status_msg = result["error"]
+                        status_time = time.time()
+                        continue
+                    api_messages.append({"role": "assistant", "content": result["text"]})
+                    exchanges.append((full_msg, result["text"]))
+                    view_idx = len(exchanges) - 1
+                    lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
+                    scroll = 0
+                    do_save_session()
+                    continue
+
+                elif cmd.startswith("/upload"):
+                    if len(parts) < 2:
+                        status_msg = "/upload <file or directory>"
+                        status_time = time.time()
+                        continue
+                    upload_path = os.path.expanduser(parts[1])
+                    if not os.path.exists(upload_path):
+                        status_msg = f"not found: {upload_path}"
+                        status_time = time.time()
+                        continue
+
+                    # Collect files
+                    files, stats = collect_files(upload_path)
+                    if not files:
+                        status_msg = "no readable files found"
+                        status_time = time.time()
+                        continue
+
+                    # Show preview and confirm
+                    preview = f"{stats['total_files']} files, ~{stats['total_chars'] // 1000}K chars"
+                    if stats["skipped"] > 0:
+                        preview += f" ({stats['skipped']} skipped)"
+                    if not confirm(stdscr, f"upload {preview}?"):
+                        status_msg = "cancelled"
+                        status_time = time.time()
+                        continue
+
+                    # Format content
+                    content, included, truncated = format_upload(files)
+                    if truncated:
+                        status_msg = f"uploaded {included}/{stats['total_files']} files (truncated to fit)"
+                    else:
+                        status_msg = f"uploaded {included} files"
+
+                    # Ask for context
+                    context = prompt_simple(stdscr, "message: ")
+                    if context is None:
+                        continue
+
+                    basename = os.path.basename(upload_path.rstrip('/'))
+                    if context:
+                        full_msg = f"{context}\n\nContents of {basename}/:\n\n{content}"
+                    else:
+                        full_msg = f"Here are the contents of {basename}/:\n\n{content}"
+
+                    api_messages.append({"role": "user", "content": full_msg})
+                    done_event = threading.Event()
+                    result = {"text": None, "error": None}
+                    def api_thread_upload():
+                        result["text"], result["error"] = fetch_response(client, api_messages, system_prompt)
+                        done_event.set()
+                    thread = threading.Thread(target=api_thread_upload, daemon=True)
+                    thread.start()
+                    animate_thinking(stdscr, done_event)
+                    thread.join()
+                    if result["error"]:
+                        api_messages.pop()
+                        status_msg = result["error"]
+                        status_time = time.time()
+                        continue
+                    api_messages.append({"role": "assistant", "content": result["text"]})
+                    exchanges.append((full_msg, result["text"]))
+                    view_idx = len(exchanges) - 1
+                    expanded = False
+                    lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
+                    scroll = 0
+                    do_save_session()
+                    status_time = time.time()
+                    continue
+
                 else:
                     status_msg = f"unknown: {cmd}  (/help)"
                     status_time = time.time()
@@ -837,7 +1257,7 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
             result = {"text": None, "error": None}
 
             def api_thread():
-                result["text"], result["error"] = fetch_response(client, api_messages)
+                result["text"], result["error"] = fetch_response(client, api_messages, system_prompt)
                 done_event.set()
 
             thread = threading.Thread(target=api_thread, daemon=True)
@@ -853,18 +1273,51 @@ def chat_session(stdscr, client, accent, prompt_color, session_data, session_fil
                 status_msg = error
                 status_time = time.time()
                 if view_idx >= 0:
-                    lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+                    lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
                 continue
 
             api_messages.append({"role": "assistant", "content": response_text})
             exchanges.append((user_input, response_text))
 
-            # Set title from first exchange
+            # Generate title from first exchange via quick API call
             if len(exchanges) == 1:
-                session_data["title"] = make_slug(user_input, 8).replace("_", " ")
+                def gen_title():
+                    try:
+                        prompt_preview = user_input[:200]
+                        response_preview = response_text[:200]
+                        r = client.messages.create(
+                            model=MODEL,
+                            max_tokens=20,
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    "Summarize this conversation in 3-6 words for use as a short title. "
+                                    "Reply with ONLY the title. No quotes. No period.\n\n"
+                                    f"User: {prompt_preview}\n\n"
+                                    f"Assistant: {response_preview}"
+                                ),
+                            }],
+                        )
+                        for block in r.content:
+                            if hasattr(block, 'text'):
+                                title = block.text.strip().strip('"\'.:')
+                                title = title.replace('\n', ' ')
+                                if len(title) > 3:
+                                    return title[:60]
+                    except Exception:
+                        pass
+                    return user_input.strip().split('\n')[0][:60]  # fallback
+
+                # Run in background so it doesn't block
+                def title_thread():
+                    session_data["title"] = gen_title()
+                    do_save_session()
+
+                threading.Thread(target=title_thread, daemon=True).start()
 
             view_idx = len(exchanges) - 1
-            lines = build_exchange_lines(exchanges, view_idx, w, prompt_color)
+            expanded = False  # start collapsed for new responses
+            lines = build_exchange_lines(exchanges, view_idx, w, prompt_color, expanded)
             scroll = 0
 
             # Auto-save session after each exchange
@@ -886,6 +1339,7 @@ def main(stdscr):
 
     curses.init_pair(1, curses.COLOR_CYAN, -1)
     curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # block labels
     accent = curses.color_pair(1)
     prompt_color = curses.color_pair(1)
 
