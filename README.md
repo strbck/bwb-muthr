@@ -48,6 +48,6 @@ In the Software folder, you will also find my .bashrc and .bashprofile file, whi
 
 For more a more detailed breakdown of the cost for each variant, please reference the individual BOMs in their respective directory. Below are the rough totals for each variant. Screws and filament are not included in the total cost.
 
-**TOTAL COST: $270**
+**TOTAL COST: $200**
 
 (This number does NOT include shipping, taxes and/or tariffs)
